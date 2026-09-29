@@ -1,0 +1,50 @@
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@500;600;700;800;900&family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+    margin: 0;
+    font-family: 'IBM Plex Sans', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+.font-display { font-family: 'Playfair Display', serif; }
+.font-mono, .tabular { font-family: 'IBM Plex Mono', monospace; }
+
+@layer base {
+    :root {
+        --background: 0 0% 98%;
+        --foreground: 0 0% 7%;
+        --card: 0 0% 100%;
+        --card-foreground: 0 0% 7%;
+        --popover: 0 0% 100%;
+        --popover-foreground: 0 0% 7%;
+        --primary: 12 100% 50%;
+        --primary-foreground: 0 0% 100%;
+        --secondary: 0 0% 95%;
+        --secondary-foreground: 0 0% 9%;
+        --muted: 0 0% 95%;
+        --muted-foreground: 0 0% 40%;
+        --accent: 0 0% 93%;
+        --accent-foreground: 0 0% 9%;
+        --destructive: 0 84% 55%;
+        --destructive-foreground: 0 0% 100%;
+        --border: 0 0% 89%;
+        --input: 0 0% 85%;
+        --ring: 12 100% 50%;
+        --radius: 0rem;
+    }
+}
+
+@layer base {
+    * { @apply border-border; }
+    body { @apply bg-background text-foreground; }
+}
+
+::selection { background: #FF3300; color: #fff; }
+
+.hard-shadow { transition: box-shadow 150ms ease-out, transform 150ms ease-out; }
+.hard-shadow:hover { box-shadow: 4px 4px 0 #111; transform: translate(-2px,-2px); }
+.zebra tbody tr:nth-child(even) { background: rgba(0,0,0,0.02); }

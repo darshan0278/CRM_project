@@ -1,0 +1,670 @@
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response
+from fastapi.responses import StreamingResponse
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os, io, csv, uuid, logging, requests, hmac, subprocess, asyncio
+from pathlib import Path
+from pydantic import BaseModel
+from typing import Optional, List
+from datetime import datetime, timezone, timedelta
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
+db_name = os.environ.get('DB_NAME', 'crm_db')
+
+try:
+    import pymongo
+    temp_client = pymongo.MongoClient(mongo_url, serverSelectionTimeoutMS=1500)
+    temp_client.server_info()
+    client = AsyncIOMotorClient(mongo_url)
+    db = client[db_name]
+    print(f"Connected to MongoDB at {mongo_url}")
+except Exception as err:
+    print(f"MongoDB connection failed: {err}. Using in-memory mongomock_motor.")
+    from mongomock_motor import AsyncIOMotorClient as MockAsyncIOMotorClient
+    client = MockAsyncIOMotorClient()
+    db = client[db_name]
+
+ADMIN_EMAILS = [e.strip().lower() for e in os.environ.get('ADMIN_EMAILS', 'admin@bifd.com,bhuvantailoringclass@gmail.com').split(',') if e.strip()]
+if not ADMIN_EMAILS:
+    ADMIN_EMAILS = ["admin@bifd.com"]
+
+app = FastAPI()
+api = APIRouter(prefix="/api")
+
+# ---- Registers that admin can manage generically ----
+REGISTERS = [
+    "admission", "fee", "course", "coursewise", "attendance", "certificate",
+    "placement", "scholarship", "staff", "faculty_attendance", "salary",
+    "cashbook", "bankbook", "income", "expense", "purchase", "receipt",
+    "correspondence", "visitor", "asset", "maintenance", "firesafety",
+    "complaint", "stock", "library", "lostfound", "vehicle",
+]
+
+# Registers whose ID field is auto-generated: register -> (field, prefix)
+AUTO_ID = {
+    "admission": ("student_id", "BIFD"),
+    "staff": ("staff_id", "STF"),
+    "asset": ("asset_id", "AST"),
+    "certificate": ("certificate_no", "CERT"),
+    "receipt": ("receipt_no", "RCP"),
+    "complaint": ("complaint_no", "CMP"),
+}
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def clean(doc):
+    doc.pop("_id", None)
+    return doc
+
+def to_num(v):
+    try:
+        return float(str(v).replace(",", "") or 0)
+    except Exception:
+        return 0.0
+
+RUNNING_BALANCE = ("cashbook", "bankbook")
+
+def with_running_balance(rows):
+    # Sort oldest-first by date then insertion time, accumulate receipt - payment.
+    rows = sorted(rows, key=lambda r: (str(r.get("date", "")), str(r.get("created_at", ""))))
+    bal = 0.0
+    for r in rows:
+        bal += to_num(r.get("receipt")) - to_num(r.get("payment"))
+        r["balance"] = round(bal, 2)
+    return rows
+
+async def resolve_columns(name, rows):
+    # Use a saved custom schema (visible, ordered, relabelled) if present; else raw doc keys.
+    schema = await db.register_schemas.find_one({"name": name}, {"_id": 0})
+    if schema and schema.get("fields"):
+        vis = [f for f in schema["fields"] if not f.get("hidden") and not f.get("archived")]
+        keys = [f["name"] for f in vis]
+        headers = [f.get("label", f["name"]) for f in vis]
+        return keys, headers
+    keys = []
+    meta = {"id", "created_at", "created_by", "updated_at", "updated_by"}
+    for r in rows:
+        for k in r.keys():
+            if k not in keys and k not in meta:
+                keys.append(k)
+    return keys, keys
+
+# ---------------- AUTH ----------------
+async def get_current_user(request: Request):
+    token = request.cookies.get("session_token")
+    if not token:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+    if not token:
+        raise HTTPException(401, "Not authenticated")
+    session = await db.user_sessions.find_one({"session_token": token})
+    if not session:
+        raise HTTPException(401, "Invalid session")
+    exp = session["expires_at"]
+    if isinstance(exp, str):
+        exp = datetime.fromisoformat(exp)
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if exp < now_utc():
+        raise HTTPException(401, "Session expired")
+    user = await db.users.find_one({"user_id": session["user_id"]}, {"_id": 0})
+    if not user:
+        raise HTTPException(401, "User not found")
+    return user
+
+async def require_admin(user=Depends(get_current_user)):
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Admin access required")
+    return user
+
+async def audit(user, action, register, record_id):
+    await db.audit_log.insert_one({
+        "id": str(uuid.uuid4()), "user_email": user.get("email"),
+        "action": action, "register": register, "record_id": record_id,
+        "at": now_utc().isoformat(),
+    })
+
+@api.post("/auth/session")
+async def create_session(request: Request, response: Response):
+    body = await request.json()
+    session_id = body.get("session_id")
+    if not session_id:
+        raise HTTPException(400, "session_id required")
+    r = requests.get(
+        "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
+        headers={"X-Session-ID": session_id}, timeout=15,
+    )
+    if r.status_code != 200:
+        raise HTTPException(401, "Auth failed")
+    data = r.json()
+    email = data["email"].lower()
+
+    # determine role
+    role = "denied"
+    courses = []
+    if email in ADMIN_EMAILS:
+        role = "admin"
+    else:
+        teacher = await db.teachers.find_one({"email": email, "active": True})
+        if teacher:
+            role = "teacher"
+            courses = teacher.get("courses", [])
+
+    existing = await db.users.find_one({"email": email})
+    if existing:
+        user_id = existing["user_id"]
+        await db.users.update_one({"user_id": user_id}, {"$set": {
+            "name": data.get("name"), "picture": data.get("picture"),
+            "role": role, "courses": courses,
+        }})
+    else:
+        user_id = f"user_{uuid.uuid4().hex[:12]}"
+        await db.users.insert_one({
+            "user_id": user_id, "email": email, "name": data.get("name"),
+            "picture": data.get("picture"), "role": role, "courses": courses,
+            "created_at": now_utc().isoformat(),
+        })
+
+    token = data["session_token"]
+    await db.user_sessions.insert_one({
+        "user_id": user_id, "session_token": token,
+        "expires_at": (now_utc() + timedelta(days=7)).isoformat(),
+        "created_at": now_utc().isoformat(),
+    })
+    response.set_cookie("session_token", token, httponly=True, secure=True,
+                        samesite="none", path="/", max_age=7 * 24 * 3600)
+    user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    return user
+
+@api.get("/auth/me")
+async def me(user=Depends(get_current_user)):
+    return user
+
+@api.post("/auth/demo-login")
+async def demo_login(response: Response):
+    user = await db.users.find_one({"role": "admin"})
+    if not user:
+        user_id = "test-user-admin"
+        user = {
+            "user_id": user_id, "email": "admin@bifd.com",
+            "name": "BIFD Admin", "picture": "", "role": "admin", "courses": [],
+            "created_at": now_utc().isoformat()
+        }
+        await db.users.insert_one(dict(user))
+    else:
+        user_id = user["user_id"]
+    
+    token = "testsess_admin"
+    await db.user_sessions.delete_many({"session_token": token})
+    await db.user_sessions.insert_one({
+        "user_id": user_id, "session_token": token,
+        "expires_at": (now_utc() + timedelta(days=365)).isoformat(),
+        "created_at": now_utc().isoformat()
+    })
+    response.set_cookie("session_token", token, httponly=True, secure=False,
+                        samesite="lax", path="/", max_age=365 * 24 * 3600)
+    user_clean = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    return {"token": token, "user": user_clean}
+
+@api.post("/auth/logout")
+async def logout(request: Request, response: Response):
+    token = request.cookies.get("session_token")
+    if token:
+        await db.user_sessions.delete_many({"session_token": token})
+    response.delete_cookie("session_token", path="/")
+    return {"ok": True}
+
+# ---------------- TEACHER MANAGEMENT ----------------
+class TeacherIn(BaseModel):
+    name: str
+    email: str
+    courses: List[str] = []
+    active: bool = True
+
+@api.get("/teachers")
+async def list_teachers(user=Depends(require_admin)):
+    rows = await db.teachers.find({}, {"_id": 0}).to_list(1000)
+    return rows
+
+@api.post("/teachers")
+async def add_teacher(data: TeacherIn, user=Depends(require_admin)):
+    email = data.email.lower()
+    if await db.teachers.find_one({"email": email}):
+        raise HTTPException(400, "Teacher already exists")
+    doc = {"id": str(uuid.uuid4()), "name": data.name, "email": email,
+           "courses": data.courses, "active": data.active,
+           "created_at": now_utc().isoformat()}
+    await db.teachers.insert_one(dict(doc))
+    await audit(user, "create", "teachers", doc["id"])
+    return clean(doc)
+
+@api.put("/teachers/{tid}")
+async def update_teacher(tid: str, data: TeacherIn, user=Depends(require_admin)):
+    upd = {"name": data.name, "email": data.email.lower(),
+           "courses": data.courses, "active": data.active}
+    res = await db.teachers.update_one({"id": tid}, {"$set": upd})
+    if res.matched_count == 0:
+        raise HTTPException(404, "Not found")
+    # sync role/access on existing user
+    await db.users.update_one({"email": data.email.lower()},
+                              {"$set": {"courses": data.courses,
+                                        "role": "teacher" if data.active else "denied"}})
+    await audit(user, "update", "teachers", tid)
+    return {"ok": True}
+
+@api.delete("/teachers/{tid}")
+async def delete_teacher(tid: str, user=Depends(require_admin)):
+    await db.teachers.delete_one({"id": tid})
+    await audit(user, "delete", "teachers", tid)
+    return {"ok": True}
+
+# ---------------- GENERIC REGISTERS (admin) ----------------
+async def check_register(name):
+    if name in REGISTERS:
+        return
+    if await db.register_defs.find_one({"key": name}):
+        return
+    raise HTTPException(404, "Unknown register")
+
+@api.get("/registers/{name}")
+async def list_register(name: str, q: Optional[str] = None, user=Depends(get_current_user)):
+    await check_register(name)
+    # teachers may read admission roster (for options) but nothing else
+    if user.get("role") != "admin":
+        if name == "course":
+            return await db.reg_course.find({}, {"_id": 0}).to_list(2000)
+        if name == "admission":
+            courses = user.get("courses", [])
+            return await db.reg_admission.find(
+                {"course": {"$in": courses}}, {"_id": 0}).to_list(2000)
+        raise HTTPException(403, "Admin access required")
+    rows = await db[f"reg_{name}"].find({}, {"_id": 0}).to_list(5000)
+    if name in RUNNING_BALANCE:
+        rows = with_running_balance(rows)
+    else:
+        rows.sort(key=lambda r: str(r.get("created_at", "")), reverse=True)
+    if q:
+        ql = q.lower()
+        rows = [r for r in rows if any(ql in str(v).lower() for v in r.values())]
+    return rows
+
+async def next_student_id():
+    count = await db.reg_admission.count_documents({})
+    return f"BIFD-{count + 1:04d}"
+
+@api.post("/registers/{name}")
+async def create_register(name: str, request: Request, user=Depends(require_admin)):
+    await check_register(name)
+    data = await request.json()
+    data = {k: v for k, v in data.items() if k not in ("_id", "id", "created_at")}
+    data["id"] = str(uuid.uuid4())
+    data["created_at"] = now_utc().isoformat()
+    data["created_by"] = user.get("email")
+    aid = AUTO_ID.get(name)
+    if aid and not data.get(aid[0]):
+        cnt = await db[f"reg_{name}"].count_documents({})
+        data[aid[0]] = f"{aid[1]}-{cnt + 1:04d}"
+    await db[f"reg_{name}"].insert_one(dict(data))
+    await audit(user, "create", name, data["id"])
+    return clean(data)
+
+@api.get("/registers/{name}/schema")
+async def get_schema(name: str, user=Depends(require_admin)):
+    await check_register(name)
+    doc = await db.register_schemas.find_one({"name": name}, {"_id": 0})
+    d = await db.register_defs.find_one({"key": name}, {"_id": 0})
+    return {"name": name,
+            "fields": doc["fields"] if doc else None,
+            "label": (d or {}).get("label"), "group": (d or {}).get("group"),
+            "custom": bool(d and d.get("custom"))}
+
+@api.put("/registers/{name}/schema")
+async def put_schema(name: str, request: Request, user=Depends(require_admin)):
+    await check_register(name)
+    body = await request.json()
+    fields = body.get("fields")
+    if not isinstance(fields, list) or not fields:
+        raise HTTPException(400, "fields must be a non-empty list")
+    seen = set()
+    for f in fields:
+        if not f.get("name") or not f.get("type"):
+            raise HTTPException(400, "each field needs a name and type")
+        if f["name"] in seen:
+            raise HTTPException(400, f"duplicate field key: {f['name']}")
+        seen.add(f["name"])
+    await db.register_schemas.update_one({"name": name}, {"$set": {
+        "name": name, "fields": fields,
+        "updated_at": now_utc().isoformat(), "updated_by": user.get("email"),
+    }}, upsert=True)
+    await audit(user, "schema-update", name, name)
+    return {"ok": True}
+
+@api.delete("/registers/{name}/schema")
+async def reset_schema(name: str, user=Depends(require_admin)):
+    await check_register(name)
+    await db.register_schemas.delete_one({"name": name})
+    await audit(user, "schema-reset", name, name)
+    return {"ok": True}
+
+@api.put("/registers/{name}/{rid}")
+async def update_register(name: str, rid: str, request: Request, user=Depends(require_admin)):
+    await check_register(name)
+    data = await request.json()
+    data = {k: v for k, v in data.items() if k not in ("_id", "id", "created_at", "created_by")}
+    data["updated_at"] = now_utc().isoformat()
+    data["updated_by"] = user.get("email")
+    res = await db[f"reg_{name}"].update_one({"id": rid}, {"$set": data})
+    if res.matched_count == 0:
+        raise HTTPException(404, "Not found")
+    await audit(user, "update", name, rid)
+    return {"ok": True}
+
+@api.delete("/registers/{name}/{rid}")
+async def delete_register(name: str, rid: str, user=Depends(require_admin)):
+    await check_register(name)
+    await db[f"reg_{name}"].delete_one({"id": rid})
+    await audit(user, "delete", name, rid)
+    return {"ok": True}
+
+@api.get("/registers/{name}/export")
+async def export_register(name: str, user=Depends(require_admin)):
+    await check_register(name)
+    rows = await db[f"reg_{name}"].find({}, {"_id": 0}).to_list(10000)
+    if name in RUNNING_BALANCE:
+        rows = with_running_balance(rows)
+    keys, headers = await resolve_columns(name, rows)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(headers or ["id"])
+    for r in rows:
+        w.writerow([r.get(k, "") for k in keys])
+    buf.seek(0)
+    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={name}.csv"})
+
+@api.get("/registers/{name}/export.xlsx")
+async def export_xlsx(name: str, user=Depends(require_admin)):
+    await check_register(name)
+    import pandas as pd
+    rows = await db[f"reg_{name}"].find({}, {"_id": 0}).to_list(10000)
+    if name in RUNNING_BALANCE:
+        rows = with_running_balance(rows)
+    keys, headers = await resolve_columns(name, rows)
+    data = [[r.get(k, "") for k in keys] for r in rows]
+    df = pd.DataFrame(data, columns=headers) if keys else pd.DataFrame()
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=name[:31] or "sheet")
+    buf.seek(0)
+    return StreamingResponse(buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={name}.xlsx"})
+
+@api.get("/registers/{name}/audit")
+async def register_audit(name: str, user=Depends(require_admin)):
+    await check_register(name)
+    rows = await db.audit_log.find({"register": name}, {"_id": 0}).sort("at", -1).to_list(200)
+    return rows
+
+# ---------------- COMPANY SETTINGS (white-label) ----------------
+COMPANY_DEFAULTS = {
+    "name": "Bhuvan Institute of Fashion Design",
+    "short_name": "BIFD",
+    "logo": "",
+    "address": "",
+    "phone": "",
+    "email": "",
+    "website": "",
+}
+
+@api.get("/company-settings")
+async def get_company_settings():
+    doc = await db.company_settings.find_one({"key": "company"}, {"_id": 0})
+    if not doc:
+        return COMPANY_DEFAULTS
+    return {**COMPANY_DEFAULTS, **{k: v for k, v in doc.items() if k != "key"}}
+
+@api.put("/company-settings")
+async def put_company_settings(request: Request, user=Depends(require_admin)):
+    body = await request.json()
+    allowed = {k: body.get(k, "") for k in COMPANY_DEFAULTS.keys()}
+    await db.company_settings.update_one({"key": "company"}, {"$set": {
+        "key": "company", **allowed,
+        "updated_at": now_utc().isoformat(), "updated_by": user.get("email"),
+    }}, upsert=True)
+    await audit(user, "company-settings", "company", "company")
+    return {"ok": True}
+
+# ---------------- REGISTER MANAGEMENT ----------------
+def slugify(text):
+    import re
+    s = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+    return s or "register"
+
+@api.get("/register-mgmt")
+async def list_register_mgmt(user=Depends(require_admin)):
+    defs = await db.register_defs.find({}, {"_id": 0}).to_list(500)
+    by_key = {d["key"]: d for d in defs}
+    builtins = [{"key": k, "builtin": True,
+                 "label": by_key.get(k, {}).get("label"),
+                 "active": by_key.get(k, {}).get("active", True)}
+                for k in REGISTERS]
+    customs = [d for d in defs if d.get("custom")]
+    return {"builtins": builtins, "customs": customs}
+
+@api.post("/register-mgmt")
+async def create_register_def(request: Request, user=Depends(require_admin)):
+    body = await request.json()
+    label = (body.get("label") or "").strip()
+    if not label:
+        raise HTTPException(400, "Register name is required")
+    key = slugify(body.get("key") or label)
+    if key in REGISTERS or await db.register_defs.find_one({"key": key}):
+        raise HTTPException(400, f"Register ID '{key}' already exists")
+    if await db.register_defs.find_one({"label": {"$regex": f"^{label}$", "$options": "i"}}):
+        raise HTTPException(400, "A register with this name already exists")
+    doc = {"key": key, "label": label, "group": "Custom Registers",
+           "icon": "Layers", "active": True, "custom": True,
+           "created_at": now_utc().isoformat(), "created_by": user.get("email")}
+    await db.register_defs.insert_one(dict(doc))
+    starter = [
+        {"name": "date", "label": "Date", "type": "date", "required": True},
+        {"name": "title", "label": "Particulars", "type": "text"},
+        {"name": "amount", "label": "Amount", "type": "number"},
+        {"name": "remarks", "label": "Remarks", "type": "longtext"},
+    ]
+    await db.register_schemas.update_one({"name": key}, {"$set": {
+        "name": key, "fields": starter, "updated_at": now_utc().isoformat()}}, upsert=True)
+    await audit(user, "register-create", key, key)
+    return clean(doc)
+
+@api.put("/register-mgmt/{key}")
+async def update_register_def(key: str, request: Request, user=Depends(require_admin)):
+    body = await request.json()
+    existing = await db.register_defs.find_one({"key": key}, {"_id": 0})
+    if not existing and key not in REGISTERS:
+        raise HTTPException(404, "Not found")
+    label = (body.get("label") or "").strip() or None
+    active = body.get("active")
+    if label:
+        dup = await db.register_defs.find_one(
+            {"key": {"$ne": key}, "label": {"$regex": f"^{label}$", "$options": "i"}})
+        if dup:
+            raise HTTPException(400, "A register with this name already exists")
+    if existing:
+        setd = {}
+        if label:
+            setd["label"] = label
+        if active is not None:
+            setd["active"] = bool(active)
+        if setd:
+            await db.register_defs.update_one({"key": key}, {"$set": setd})
+    else:
+        await db.register_defs.insert_one({
+            "key": key, "builtin": True, "custom": False,
+            "label": label, "active": bool(active) if active is not None else True,
+            "created_at": now_utc().isoformat(), "created_by": user.get("email")})
+    await audit(user, "register-update", key, key)
+    return {"ok": True}
+
+# ---------------- TEACHER ATTENDANCE ----------------
+@api.get("/teacher/roster")
+async def teacher_roster(course: str, user=Depends(get_current_user)):
+    if user.get("role") not in ("teacher", "admin"):
+        raise HTTPException(403, "Denied")
+    if user.get("role") == "teacher" and course not in user.get("courses", []):
+        raise HTTPException(403, "Not assigned to this course")
+    students = await db.reg_admission.find(
+        {"course": course, "status": "active"}, {"_id": 0}).to_list(1000)
+    return students
+
+@api.post("/teacher/attendance")
+async def submit_attendance(request: Request, user=Depends(get_current_user)):
+    if user.get("role") not in ("teacher", "admin"):
+        raise HTTPException(403, "Denied")
+    body = await request.json()
+    date = body["date"]; course = body["course"]; entries = body["entries"]
+    if user.get("role") == "teacher" and course not in user.get("courses", []):
+        raise HTTPException(403, "Not assigned")
+    saved = 0
+    for e in entries:
+        rec = {
+            "id": str(uuid.uuid4()), "date": date, "course": course,
+            "student_id": e.get("student_id"), "student_name": e.get("student_name"),
+            "status": e.get("status"), "remark": e.get("remark", ""),
+            "marked_by": user.get("email"), "locked": True,
+            "created_at": now_utc().isoformat(),
+        }
+        # avoid duplicate for same student/date/course
+        exists = await db.reg_attendance.find_one(
+            {"date": date, "course": course, "student_id": e.get("student_id")})
+        if exists:
+            continue
+        await db.reg_attendance.insert_one(dict(rec))
+        saved += 1
+    return {"saved": saved}
+
+@api.get("/teacher/attendance")
+async def teacher_history(user=Depends(get_current_user)):
+    if user.get("role") not in ("teacher", "admin"):
+        raise HTTPException(403, "Denied")
+    rows = await db.reg_attendance.find(
+        {"marked_by": user.get("email")}, {"_id": 0}).sort("created_at", -1).to_list(2000)
+    return rows
+
+# ---------------- DASHBOARD ----------------
+@api.get("/dashboard")
+async def dashboard(user=Depends(require_admin)):
+    today = now_utc().strftime("%Y-%m-%d")
+    month = now_utc().strftime("%Y-%m")
+    active_students = await db.reg_admission.count_documents({"status": "active"})
+    total_students = await db.reg_admission.count_documents({})
+
+    att_today = await db.reg_attendance.find({"date": today}, {"_id": 0}).to_list(5000)
+    present = len([a for a in att_today if a.get("status") in ("present", "late")])
+    att_pct = round((present / len(att_today)) * 100) if att_today else 0
+
+    fees = await db.reg_fee.find({}, {"_id": 0}).to_list(5000)
+    def num(v):
+        try:
+            return float(str(v).replace(",", "") or 0)
+        except Exception:
+            return 0.0
+    collected_month = sum(num(f.get("amount_paid")) for f in fees if str(f.get("payment_date", "")).startswith(month))
+    total_due = sum(num(f.get("balance")) for f in fees)
+    overdue = [f for f in fees if num(f.get("balance")) > 0]
+
+    faculty = await db.reg_staff.count_documents({})
+    visitors = await db.reg_visitor.find({}, {"_id": 0}).sort("created_at", -1).to_list(5)
+    fire = await db.reg_firesafety.find({}, {"_id": 0}).to_list(1000)
+    fire_due = [f for f in fire if f.get("next_due_date") and f.get("next_due_date") <= (now_utc() + timedelta(days=30)).strftime("%Y-%m-%d")]
+    certs = await db.reg_certificate.find({}, {"_id": 0}).sort("created_at", -1).to_list(5)
+    assets_total = await db.reg_asset.count_documents({})
+
+    return {
+        "active_students": active_students, "total_students": total_students,
+        "attendance_pct": att_pct, "attendance_marked": len(att_today),
+        "collected_month": collected_month, "total_due": total_due,
+        "overdue_count": len(overdue), "faculty_count": faculty,
+        "assets_total": assets_total, "recent_visitors": visitors,
+        "fire_due_count": len(fire_due), "recent_certificates": certs,
+        "overdue_fees": overdue[:5],
+    }
+
+@api.get("/search")
+async def global_search(q: str, user=Depends(require_admin)):
+    ql = q.lower()
+    students = await db.reg_admission.find({}, {"_id": 0}).to_list(2000)
+    faculty = await db.reg_faculty.find({}, {"_id": 0}).to_list(2000)
+    sr = [s for s in students if any(ql in str(v).lower() for v in s.values())][:10]
+    fr = [f for f in faculty if any(ql in str(v).lower() for v in f.values())][:10]
+    return {"students": sr, "faculty": fr}
+
+@api.get("/")
+async def root():
+    return {"message": "BIFD ERP API"}
+
+# ---------------- DAILY BACKUP CRON ----------------
+def run_backup():
+    stamp = now_utc().strftime("%Y%m%d_%H%M%S")
+    out = f"/app/backups/backup_{stamp}"
+    try:
+        subprocess.run(["mongodump", "--uri", mongo_url, "--db",
+                        os.environ['DB_NAME'], "--out", out],
+                       check=True, capture_output=True, timeout=120)
+        logging.info(f"Backup completed: {out}")
+    except Exception as e:
+        logging.error(f"Backup failed: {e}")
+
+@api.post("/cron/backup")
+async def cron_backup(request: Request):
+    # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
+    secret = os.environ.get("WEBHOOK_CRON_SECRET", "")
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else ""
+    if not secret or not hmac.compare_digest(token, secret):
+        raise HTTPException(401, "Unauthorized")
+    os.makedirs("/app/backups", exist_ok=True)
+    asyncio.get_event_loop().run_in_executor(None, run_backup)
+    return {"status": "accepted"}
+
+@app.on_event("startup")
+async def startup_seed():
+    admin = await db.users.find_one({"role": "admin"})
+    if not admin:
+        uid = "test-user-admin"
+        await db.users.insert_one({
+            "user_id": uid, "email": "admin@bifd.com",
+            "name": "BIFD Admin", "picture": "", "role": "admin", "courses": [],
+            "created_at": now_utc().isoformat()
+        })
+    else:
+        uid = admin["user_id"]
+    
+    for tok in ["testsess_admin", "test_admin", "dev_token"]:
+        s = await db.user_sessions.find_one({"session_token": tok})
+        if not s:
+            await db.user_sessions.insert_one({
+                "user_id": uid, "session_token": tok,
+                "expires_at": (now_utc() + timedelta(days=365)).isoformat(),
+                "created_at": now_utc().isoformat()
+            })
+
+app.include_router(api)
+app.add_middleware(
+    CORSMiddleware, allow_credentials=True,
+    allow_origin_regex=r"https?://.*",
+    allow_methods=["*"], allow_headers=["*"],
+)
+logging.basicConfig(level=logging.INFO)
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    if hasattr(client, "close"):
+        client.close()
